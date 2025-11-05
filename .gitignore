@@ -1,0 +1,56 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+.env/
+pip-wheel-metadata/
+
+# Archivos de caché y compilación
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+
+# Archivos específicos del sistema operativo/editor
+.DS_Store
+.cache/
+.pytest_cache/
+.vscode/
+.idea/
+Thumbs.db
+
+# Archivos de registro y bases de datos
+*.log
+*.sqlite3
+/db.sqlite3
+
+# Archivos de configuración y credenciales (manejar con precaución)
+.env
+config.ini
+settings.json
+# Si utilizas variables de entorno, asegúrate de ignorar el archivo que las contiene.
+
+# PyInstaller
+# Archivos generados por PyInstaller
+*.spec
+dist/
+build/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Misceláneo
+# Archivos temporales generados por el sistema
+*~

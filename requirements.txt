@@ -1,0 +1,11 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
+pydantic-settings==2.4.0
+SQLAlchemy==2.0.34
+psycopg2-binary==2.9.9
+pandas==2.2.2
+xgboost==2.1.1
+python-dotenv==1.0.1
+numpy==1.26.4
+streamlit==1.39.0
