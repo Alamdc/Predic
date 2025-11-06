@@ -23,7 +23,7 @@ pip install -r requirements.txt
 ```
 4) Levanta FastAPI (terminal 1):
 ```bash
-uvicorn fastapi_app.main:app --host $API_HOST --port $API_PORT --reload
+uvicorn fastapi_app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 5) Levanta Streamlit (terminal 2):
 ```bash

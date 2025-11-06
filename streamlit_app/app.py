@@ -26,11 +26,11 @@ st.caption("FastAPI solo para datos • Entrenamiento y predicción ocurren en S
 # Sidebar – Filtros
 with st.sidebar:
     st.header("Filtros de extracción (FastAPI)")
-    edo = st.number_input("edo (opcional)", min_value=0, value=None, step=1, format="%d")
-    adm = st.number_input("adm (opcional)", min_value=0, value=None, step=1, format="%d")
-    sucursal = st.text_input("sucursal (opcional)")
-    start = st.date_input("Desde (opcional)", value=None)
-    end = st.date_input("Hasta (opcional)", value=None)
+    edo = st.number_input("edo", min_value=0, value=None, step=1, format="%d")
+    adm = st.number_input("adm", min_value=0, value=None, step=1, format="%d")
+    sucursal = st.text_input("sucursal")
+    start = st.date_input("Desde", value=None)
+    end = st.date_input("Hasta", value=None)
 
     if start and end and start > end:
         st.error("La fecha 'Desde' no puede ser mayor que 'Hasta'.")
@@ -205,7 +205,7 @@ for key, pred_df in results:
 
 all_preds_df = pd.concat(all_preds, ignore_index=True) if all_preds else pd.DataFrame()
 
-if not all_preds_df.empty and st.button("Guardar predicciones en PostgreSQL (UPSERT)"):
+if not all_preds_df.empty and st.button("Subir Predicciones"):
     try:
         cols = [
             "edo","adm","sucursal","fecha_predicha",
@@ -237,6 +237,6 @@ if not all_preds_df.empty and st.button("Guardar predicciones en PostgreSQL (UPS
 
 if not all_preds_df.empty:
     csv = all_preds_df.to_csv(index=False).encode('utf-8')
-    st.download_button("Descargar predicciones (CSV)", data=csv, file_name="predicciones_flujo.csv", mime="text/csv")
+    st.download_button("Descargar predicciones", data=csv, file_name="predicciones_flujo.csv", mime="text/csv")
 
 st.caption("© predicciones – XGBoost + Streamlit + FastAPI (solo datos)")
