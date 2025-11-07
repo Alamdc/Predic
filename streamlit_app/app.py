@@ -20,12 +20,11 @@ PG_DSN = f"host={os.getenv('PG_HOST')} port={os.getenv('PG_PORT')} dbname={os.ge
 PG_SCHEMA = os.getenv('PG_SCHEMA', 'data')
 
 st.set_page_config(page_title="Predicciones de Flujo – XGBoost", layout="wide")
-st.title("Predicciones de Flujo de Efectivo (XGBoost)")
-st.caption("FastAPI solo para datos • Entrenamiento y predicción ocurren en Streamlit")
+st.title("Predicciones de Flujo de Efectivo con XGBoost")
 
 # Sidebar – Filtros
 with st.sidebar:
-    st.header("Filtros de extracción (FastAPI)")
+    st.header("Filtros de extracción")
     edo = st.number_input("edo", min_value=0, value=None, step=1, format="%d")
     adm = st.number_input("adm", min_value=0, value=None, step=1, format="%d")
     sucursal = st.text_input("sucursal")
@@ -35,10 +34,10 @@ with st.sidebar:
     if start and end and start > end:
         st.error("La fecha 'Desde' no puede ser mayor que 'Hasta'.")
 
-    n_days = st.number_input("Días a predecir", min_value=1, max_value=60, value=14)
+    n_days = st.number_input("Días a predecir", min_value=1, max_value=60, value=7)
     test_size_days = st.number_input("Días recientes para validar (RMSE)", min_value=7, max_value=120, value=28)
 
-    if st.button("Cargar datos de FastAPI"):
+    if st.button("Cargar datos"):
         payload = {
             "edo": int(edo) if edo is not None else None,
             "adm": int(adm) if adm is not None else None,
@@ -56,7 +55,7 @@ with st.sidebar:
 # Datos
 rows = st.session_state.get("raw_rows")
 if not rows:
-    st.info("Usa la barra lateral para traer datos desde FastAPI.")
+    st.info("Usa la barra lateral para aplicar filtros a la extraccion de datos")
     st.stop()
 
 df = pd.DataFrame(rows)
