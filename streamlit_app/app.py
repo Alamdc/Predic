@@ -1,8 +1,5 @@
 import os
 import json
-import math
-import random
-from collections import defaultdict
 from datetime import date, timedelta
 
 import numpy as np
@@ -16,19 +13,72 @@ from dotenv import load_dotenv
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 from sklearn.model_selection import ParameterSampler
 
+# ===================== Carga de variables =====================
 load_dotenv()
 
 API_HOST = os.getenv('API_HOST', '127.0.0.1')
 API_PORT = int(os.getenv('API_PORT', '8000'))
 API_URL = f"http://{API_HOST}:{API_PORT}/data"
 
-PG_DSN = f"host={os.getenv('PG_HOST')} port={os.getenv('PG_PORT')} dbname={os.getenv('PG_DATABASE')} user={os.getenv('PG_USER')} password={os.getenv('PG_PASSWORD')}"
+PG_DSN = (
+    f"host={os.getenv('PG_HOST')} "
+    f"port={os.getenv('PG_PORT')} "
+    f"dbname={os.getenv('PG_DATABASE')} "
+    f"user={os.getenv('PG_USER')} "
+    f"password={os.getenv('PG_PASSWORD')}"
+)
 PG_SCHEMA = os.getenv('PG_SCHEMA', 'data')
 
+# ===================== Config Streamlit =====================
 st.set_page_config(page_title="Predicciones de Flujo – XGBoost+", layout="wide")
-st.title("📈 Predicciones de Flujo de Efectivo (XGBoost+)")
-st.caption("FastAPI solo para datos • Mejoras: tuning por ADM, backtest rolling, escenarios, PI por bootstrap")
+st.title("Predicciones de Flujo de Efectivo (XGBoost+)")
 
+# ===================== Helper compatible con distintas versiones de XGBoost =====================
+def safe_fit(model, Xtr, ytr, Xva=None, yva=None, early_stopping=0):
+    """
+    Entrena XGBRegressor probando distintas firmas de .fit() para ser
+    compatible con versiones que no aceptan callbacks, eval_metric o
+    early_stopping_rounds en fit.
+    """
+    fit_kwargs = {}
+    if Xva is not None and yva is not None:
+        fit_kwargs["eval_set"] = [(Xva, yva)]
+
+    # 1) Intentar con callbacks (algunas builds de 2.x)
+    if early_stopping and Xva is not None:
+        try:
+            cb = xgb.callback.EarlyStopping(rounds=int(early_stopping), min_delta=0.0, save_best=True)
+            model.fit(Xtr, ytr, verbose=False, callbacks=[cb], **fit_kwargs)
+            return model
+        except TypeError:
+            pass
+        except Exception:
+            pass
+
+    # 2) Intentar con early_stopping_rounds en fit (1.7.x y algunas builds)
+    if early_stopping and Xva is not None:
+        try:
+            model.fit(Xtr, ytr, verbose=False, early_stopping_rounds=int(early_stopping), **fit_kwargs)
+            return model
+        except TypeError:
+            pass
+        except Exception:
+            pass
+
+    # 3) Intento simple con verbose=False
+    try:
+        model.fit(Xtr, ytr, verbose=False, **fit_kwargs)
+        return model
+    except TypeError:
+        pass
+    except Exception:
+        pass
+
+    # 4) Último recurso: sin verbose ni extras
+    model.fit(Xtr, ytr, **fit_kwargs)
+    return model
+
+# ===================== Sidebar =====================
 with st.sidebar:
     st.header("Filtros de extracción (FastAPI)")
     edo = st.number_input("edo (opcional)", min_value=0, value=None, step=1, format="%d")
@@ -57,7 +107,7 @@ with st.sidebar:
     escenario_e = st.slider("Ajuste Entradas futuras (%)", min_value=-50, max_value=50, value=0, step=5)
     escenario_s = st.slider("Ajuste Salidas futuras (%)", min_value=-50, max_value=50, value=0, step=5)
 
-    if st.button("🔄 Cargar datos de FastAPI"):
+    if st.button("Cargar datos de FastAPI"):
         payload = {
             "edo": int(edo) if edo is not None else None,
             "adm": int(adm) if adm is not None else None,
@@ -72,9 +122,10 @@ with st.sidebar:
         st.session_state["raw_rows"] = data
         st.success(f"Se cargaron {len(data)} filas.")
 
+# ===================== Datos =====================
 rows = st.session_state.get("raw_rows")
 if not rows:
-    st.info("Usa la barra lateral para traer datos desde FastAPI.")
+    st.info("Usa la barra lateral para aplicar filtros")
     st.stop()
 
 df = pd.DataFrame(rows)
@@ -85,6 +136,7 @@ if df.empty:
 if "fecha" in df.columns:
     df["fecha"] = pd.to_datetime(df["fecha"]).dt.date
 
+# ===================== Features =====================
 BASE_FEATURES = [
     "entradas", "salidas",
     "anio", "trimestre", "mes", "semana_anio", "dia_semana",
@@ -93,12 +145,16 @@ BASE_FEATURES = [
 ]
 TARGET = "flujo_efectivo"
 
-def enrich_features(g: pd.DataFrame) -> pd.DataFrame:
+def enrich_features(g: pd.DataFrame):
+    """Features adicionales 'al vuelo' sin tocar DB."""
     g = g.copy()
     g["neto_es"] = (g["entradas"] - g["salidas"]).astype(float)
     with np.errstate(divide='ignore', invalid='ignore'):
-        g["ratio_es"] = np.where((g["salidas"].astype(float) + 1.0) != 0.0,
-                                 g["entradas"].astype(float) / (g["salidas"].astype(float) + 1.0), 0.0)
+        g["ratio_es"] = np.where(
+            (g["salidas"].astype(float) + 1.0) != 0.0,
+            g["entradas"].astype(float) / (g["salidas"].astype(float) + 1.0),
+            0.0
+        )
     g["abs_diff_es"] = (g["entradas"].astype(float) - g["salidas"].astype(float)).abs()
     g["sin_dow"] = np.sin(2*np.pi*(g["dia_semana"].astype(float)/7.0))
     g["cos_dow"] = np.cos(2*np.pi*(g["dia_semana"].astype(float)/7.0))
@@ -118,6 +174,7 @@ def build_future_calendar(d: date) -> dict:
     }
 
 def compute_estacional_tables(g: pd.DataFrame):
+    """Medianas por (dow, mes) para estimar futuras entradas/salidas."""
     g = g.copy()
     g["dow"] = g["dia_semana"]
     g["m"] = g["mes"]
@@ -137,6 +194,7 @@ def get_future_es(dow:int, month:int, e_tab, s_tab, e_global:float, s_global:flo
     return e, s
 
 def rolling_backtest(series_df: pd.DataFrame, features: list, target: str, n_folds:int=3, params:dict=None, early_stopping:int=50):
+    """Backtest con origen rodante en espacio transformado (si se usa)."""
     if params is None:
         params = dict(
             n_estimators=400, max_depth=6, learning_rate=0.05,
@@ -160,9 +218,10 @@ def rolling_backtest(series_df: pd.DataFrame, features: list, target: str, n_fol
         Xtr = train[features]; ytr = train[target]
         Xte = test[features]; yte = test[target]
 
-        model = xgb.XGBRegressor(**params)
-        model.fit(Xtr, ytr, eval_set=[(Xte, yte)], verbose=False,
-                  early_stopping_rounds=early_stopping if early_stopping>0 else None)
+        params_bt = {**params, "eval_metric": "rmse"}
+        model = xgb.XGBRegressor(**params_bt)
+        safe_fit(model, Xtr, ytr, Xva=Xte, yva=yte, early_stopping=early_stopping)
+
         pred = model.predict(Xte)
         rmses.append(np.sqrt(mean_squared_error(yte, pred)))
         mape = mean_absolute_percentage_error(np.where(yte==0, 1e-6, yte), pred)
@@ -177,6 +236,7 @@ def rolling_backtest(series_df: pd.DataFrame, features: list, target: str, n_fol
     }
 
 def random_tune(Xtr, ytr, Xte, yte, n_samples:int=20, early_stopping:int=50, seed:int=42):
+    """Búsqueda aleatoria de hiperparámetros compatible con XGBoost sklearn."""
     space = {
         "n_estimators": [200, 300, 400, 600, 800],
         "max_depth": [3,4,5,6,7,8,9],
@@ -193,23 +253,31 @@ def random_tune(Xtr, ytr, Xte, yte, n_samples:int=20, early_stopping:int=50, see
     best_rmse = float("inf")
     best = None
     for p in sampler:
-        params = dict(objective="reg:squarederror", n_jobs=4, random_state=42, **p)
+        params = dict(
+            objective="reg:squarederror",
+            n_jobs=4,
+            random_state=42,
+            eval_metric="rmse",  # en el constructor
+            **p
+        )
         model = xgb.XGBRegressor(**params)
-        model.fit(Xtr, ytr, eval_set=[(Xte, yte)], verbose=False,
-                  early_stopping_rounds=early_stopping if early_stopping>0 else None)
+        safe_fit(model, Xtr, ytr, Xva=Xte, yva=yte, early_stopping=early_stopping)
+
         pred = model.predict(Xte)
         rmse = np.sqrt(mean_squared_error(yte, pred))
         if rmse < best_rmse:
             best_rmse = rmse
             best = params
+
     return best if best is not None else dict(
         n_estimators=400, max_depth=6, learning_rate=0.05,
         subsample=0.9, colsample_bytree=0.9,
         reg_alpha=0.0, reg_lambda=1.0,
-        random_state=42, n_jobs=4, objective="reg:squarederror"
+        random_state=42, n_jobs=4, objective="reg:squarederror", eval_metric="rmse"
     )
 
 def bootstrap_pred_interval(residuals: np.ndarray, yhat: float, B:int=200, alpha:float=0.05):
+    """Intervalo por bootstrap de residuales (en escala original del target)."""
     if len(residuals) == 0:
         return yhat, yhat, yhat
     draws = np.random.choice(residuals, size=B, replace=True)
@@ -218,13 +286,15 @@ def bootstrap_pred_interval(residuals: np.ndarray, yhat: float, B:int=200, alpha
     hi = float(np.quantile(dist, 1 - alpha/2))
     return yhat, lo, hi
 
+# ===================== Vista rápida del histórico =====================
 st.subheader("Histórico cargado")
 st.dataframe(df.head(50), use_container_width=True)
 
+# ===================== Entrenamiento y predicción =====================
 metrics_rows = []
 param_cache = {}
-
 all_preds = []
+
 for (g_edo, g_adm, g_suc), g0 in df.groupby(["edo", "adm", "sucursal"], dropna=False):
     g0 = g0.sort_values("fecha").reset_index(drop=True)
 
@@ -232,12 +302,15 @@ for (g_edo, g_adm, g_suc), g0 in df.groupby(["edo", "adm", "sucursal"], dropna=F
         st.warning(f"Grupo ({g_edo}, {g_adm}, {g_suc}) con pocos datos (n={len(g0)}). Se omite.")
         continue
 
+    # Enriquecer features
     g, FEATS = enrich_features(g0)
 
+    # Transformación del target (log1p + shift para manejar ceros/negativos)
     y_min = float(g[TARGET].min())
     shift = -y_min + 1.0 if y_min <= 0 else 0.0
     g["_y_trans"] = np.log1p(g[TARGET] + shift)
 
+    # Corte para validación simple
     cutoff = len(g) - int(test_size_days)
     train_df = g.iloc[:cutoff].copy()
     valid_df = g.iloc[cutoff:].copy()
@@ -245,28 +318,42 @@ for (g_edo, g_adm, g_suc), g0 in df.groupby(["edo", "adm", "sucursal"], dropna=F
     Xtr = train_df[FEATS]; ytr = train_df["_y_trans"]
     Xva = valid_df[FEATS]; yva = valid_df["_y_trans"]
 
+    # Tuning por ADM (cache 1 vez por adm)
     if do_tune and g_adm not in param_cache:
         with st.spinner(f"Tuning ADM={g_adm} ..."):
-            best_params = random_tune(Xtr, ytr, Xva, yva, n_samples=int(n_param_samples), early_stopping=int(early_stopping))
+            best_params = random_tune(Xtr, ytr, Xva, yva,
+                                      n_samples=int(n_param_samples),
+                                      early_stopping=int(early_stopping))
             param_cache[g_adm] = best_params
     params = param_cache.get(g_adm, dict(
         n_estimators=400, max_depth=6, learning_rate=0.05,
         subsample=0.9, colsample_bytree=0.9,
         reg_alpha=0.0, reg_lambda=1.0,
-        random_state=42, n_jobs=4, objective="reg:squarederror"
+        random_state=42, n_jobs=4, objective="reg:squarederror", eval_metric="rmse"
     ))
 
+    # Entrenamiento final (en espacio transformado)
     model = xgb.XGBRegressor(**params)
-    model.fit(Xtr, ytr, eval_set=[(Xva, yva)], verbose=False,
-              early_stopping_rounds=int(early_stopping) if early_stopping>0 else None)
+    safe_fit(model, Xtr, ytr, Xva=Xva, yva=yva, early_stopping=int(early_stopping))
 
+    # Métrica simple en valid (transformado)
     yva_pred = model.predict(Xva)
     rmse_val = float(np.sqrt(mean_squared_error(yva, yva_pred)))
-    resid_val = (yva - yva_pred)
 
-    backtest_metrics = rolling_backtest(g[FEATS + ["_y_trans"]].rename(columns={"_y_trans": "target_bt"}),
-                                        features=FEATS, target="target_bt",
-                                        n_folds=int(n_rolling_folds), params=params, early_stopping=int(early_stopping))
+    # Residuales para bootstrap (volver a espacio original para intervalo)
+    # Convertimos yva a original y pred a original:
+    yva_orig = np.expm1(yva) - shift
+    yva_pred_orig = np.expm1(yva_pred) - shift
+    resid_val = (yva_orig - yva_pred_orig)
+
+    # Backtest rolling (en espacio transformado)
+    bt_input = g[FEATS + ["_y_trans"]].rename(columns={"_y_trans": "target_bt"})
+    backtest_metrics = rolling_backtest(
+        bt_input,
+        features=FEATS, target="target_bt",
+        n_folds=int(n_rolling_folds),
+        params=params, early_stopping=int(early_stopping)
+    )
 
     metrics_rows.append({
         "edo": g_edo, "adm": g_adm, "sucursal": g_suc,
@@ -278,8 +365,10 @@ for (g_edo, g_adm, g_suc), g0 in df.groupby(["edo", "adm", "sucursal"], dropna=F
         "bt_mape_std": backtest_metrics["mape_std"],
     })
 
+    # Tablas estacionales para futuras exógenas
     e_tab, s_tab, e_global, s_global = compute_estacional_tables(g0)
 
+    # Generar futuro
     last_date = g0['fecha'].max()
     future_dates = [last_date + timedelta(days=i) for i in range(1, int(n_days)+1)]
     s_flujo = list(g0[TARGET].values.astype(float))
@@ -298,8 +387,10 @@ for (g_edo, g_adm, g_suc), g0 in df.groupby(["edo", "adm", "sucursal"], dropna=F
         cal = build_future_calendar(d)
         dow, month = cal["dia_semana"], cal["mes"]
 
+        # Estimación estacional de entradas/salidas + ajuste de escenario
         e_future, s_future = get_future_es(dow, month, e_tab, s_tab, e_global, s_global, escenario_e, escenario_s)
 
+        # Lags/medias sobre flujo
         lag1 = float(s_flujo[-1]) if len(s_flujo) >= 1 else 0.0
         lag2 = float(s_flujo[-2]) if len(s_flujo) >= 2 else lag1
         lag3 = float(s_flujo[-3]) if len(s_flujo) >= 3 else lag2
@@ -320,11 +411,14 @@ for (g_edo, g_adm, g_suc), g0 in df.groupby(["edo", "adm", "sucursal"], dropna=F
             "lag_5": lag5,
         }
         xdf = pd.DataFrame([xrow])
-        xdf, _feats_all = enrich_features(xdf)
-        xdf = xdf[_feats_all]
+        xdf, feats_all = enrich_features(xdf)
+        xdf = xdf[feats_all]
 
+        # Predicción en espacio transformado y regreso a original
         yhat_log = float(model.predict(xdf)[0])
         yhat = float(np.expm1(yhat_log) - shift)
+
+        # Intervalo por bootstrap de residuales (en original)
         yhat_, lo, hi = bootstrap_pred_interval(residuals=resid_val.values, yhat=yhat, B=200, alpha=0.05)
 
         preds_rows.append({
@@ -345,6 +439,7 @@ for (g_edo, g_adm, g_suc), g0 in df.groupby(["edo", "adm", "sucursal"], dropna=F
     pred_df = pd.DataFrame(preds_rows)
     all_preds.append(pred_df)
 
+# ===================== Resultados =====================
 st.subheader("Resultados de predicción por grupo")
 if all_preds:
     for pred_df in all_preds:
@@ -357,26 +452,22 @@ else:
     st.warning("No se generaron predicciones (verifica filtros y tamaño de series).")
 
 st.subheader("Métricas (valid simple + backtest rolling)")
-if all_preds:
-    metrics_rows = [{
-        "edo": p["edo"].iloc[0], "adm": p["adm"].iloc[0], "sucursal": p["sucursal"].iloc[0]
-    } for p in all_preds]  # placeholder; real metrics arriba si se desea persistir por grupo
-# Mostrar métricas reales si las calculamos
-# (ya se calcularon arriba, pero para simplificar la UI las podemos volver a mostrar como tabla independiente)
-# Aquí, para mantenerlo simple en esta versión:
-# (Si quieres, puedo consolidar la tabla con 'metrics_rows' reales)
-# -- fin placeholder --
+if metrics_rows:
+    metdf = pd.DataFrame(metrics_rows)
+    st.dataframe(metdf, use_container_width=True)
+else:
+    st.info("Aún no hay métricas calculadas.")
 
-# Guardado
+# ===================== Guardado =====================
 all_preds_df = pd.concat(all_preds, ignore_index=True) if all_preds else pd.DataFrame()
-if not all_preds_df.empty and st.button("💾 Guardar predicciones en PostgreSQL (UPSERT)"):
+if not all_preds_df.empty and st.button("Guardar predicciones en PostgreSQL (UPSERT)"):
     try:
         cols = [
             "edo","adm","sucursal","fecha_predicha",
             "yhat","yhat_lower","yhat_upper",
             "modelo_version","trained_until","features"
         ]
-        insert_sql = f'''
+        insert_sql = f"""
         INSERT INTO {PG_SCHEMA}.predicciones_flujo
         ({', '.join(cols)})
         VALUES ({', '.join(['%s']*len(cols))})
@@ -389,7 +480,7 @@ if not all_preds_df.empty and st.button("💾 Guardar predicciones en PostgreSQL
           trained_until = EXCLUDED.trained_until,
           features = EXCLUDED.features,
           created_at = NOW();
-        '''
+        """
         with psycopg.connect(PG_DSN) as conn:
             with conn.cursor() as cur:
                 batch = [tuple(row[c] for c in cols) for _, row in all_preds_df.iterrows()]
@@ -401,6 +492,5 @@ if not all_preds_df.empty and st.button("💾 Guardar predicciones en PostgreSQL
 
 if not all_preds_df.empty:
     csv = all_preds_df.to_csv(index=False).encode('utf-8')
-    st.download_button("⬇️ Descargar predicciones (CSV)", data=csv, file_name="predicciones_flujo.csv", mime="text/csv")
+    st.download_button("Descargar predicciones (CSV)", data=csv, file_name="predicciones_flujo.csv", mime="text/csv")
 
-st.caption("© predicciones – XGBoost+ mejoras: tuning ADM, backtest rolling, escenarios, PI bootstrap")
