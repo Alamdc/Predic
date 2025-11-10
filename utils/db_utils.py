@@ -1,1 +1,1 @@
-# opcional: helpers de conexión
+# optional helpers
