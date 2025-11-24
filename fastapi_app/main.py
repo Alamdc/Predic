@@ -9,10 +9,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Actualizamos credenciales y el esquema por defecto a 'tdv_data'
 PG_DSN = f"host={os.getenv('PG_HOST')} port={os.getenv('PG_PORT')} dbname={os.getenv('PG_DATABASE')} user={os.getenv('PG_USER')} password={os.getenv('PG_PASSWORD')}"
-PG_SCHEMA = os.getenv('PG_SCHEMA', 'data')
+PG_SCHEMA = os.getenv('PG_SCHEMA', 'tdv_data') 
 
-app = FastAPI(title="Datos base_filtrada API", version="1.0.0")
+app = FastAPI(title="Datos base_filtrada API (tdv_data)", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,12 +54,23 @@ async def get_data(q: DataQuery):
 
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
+    # SQL Actualizado para tdv_data.base_filtrada
+    # Mapeamos las columnas nuevas a los nombres que espera el modelo (entradas, salidas, etc.)
+    # Calculamos las fechas (anio, mes, trimestre) al vuelo con EXTRACT
     sql = f"""
-    SELECT edo, adm, sucursal, fecha,
-           dia, entradas, salidas, flujo_efectivo,
-           anio, trimestre, mes, semana_anio, dia_semana,
-           media_movil_3, media_movil_5, media_movil_10, media_movil_14,
-           lag_1, lag_2, lag_3, lag_5
+    SELECT 
+        edo, adm, sucursal, fecha,
+        EXTRACT(DAY FROM fecha) as dia,
+        sumingresos as entradas, 
+        sumegresos as salidas, 
+        flujo_efec as flujo_efectivo,
+        EXTRACT(YEAR FROM fecha) as anio,
+        EXTRACT(QUARTER FROM fecha) as trimestre,
+        EXTRACT(MONTH FROM fecha) as mes,
+        EXTRACT(WEEK FROM fecha) as semana_anio,
+        EXTRACT(ISODOW FROM fecha) as dia_semana,
+        media_movil_3, media_movil_5, media_movil_10, media_movil_14,
+        lag_1, lag_2, lag_3, lag_5
     FROM {PG_SCHEMA}.base_filtrada
     {where_sql}
     ORDER BY edo, adm, sucursal, fecha
