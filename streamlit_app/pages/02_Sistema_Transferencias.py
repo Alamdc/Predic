@@ -33,7 +33,7 @@ if btn_run:
             st.stop()
         
         if df_fut.empty:
-            st.warning("No hay predicciones futuras en `data.predicciones_flujo`. El análisis usará solo historia (incompleto).")
+            st.warning("No hay predicciones futuras en `predicciones_flujo`. El análisis usará solo historia (incompleto).")
     
     with st.spinner("Calculando rangos y simulaciones..."):
         # 2. Procesar lógica de negocio
