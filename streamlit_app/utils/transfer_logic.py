@@ -1,22 +1,31 @@
 import pandas as pd
 import numpy as np
-import streamlit as st # Importamos st para poder mostrar errores si es necesario
 from .config import RANGOS
 
+# -------------------------------------------------------------------------
+# FUNCIONES AUXILIARES
+# -------------------------------------------------------------------------
+
 def determine_tipo_sucursal(df_hist: pd.DataFrame) -> pd.DataFrame:
-    """Calcula si es captadora/pagadora basado en histórico."""
+    """Calcula si es captadora (1) o pagadora (0) basado en el promedio histórico."""
     keys = ["edo", "adm", "sucursal"]
+    if df_hist.empty:
+        return pd.DataFrame(columns=keys + ["es_captadora"])
+        
     avg_flow = df_hist.groupby(keys)["flujo_efectivo"].mean().reset_index()
     avg_flow["es_captadora"] = np.where(avg_flow["flujo_efectivo"] >= 0, 1, 0)
     return avg_flow[keys + ["es_captadora"]]
 
 def calcular_ultimo_saldo(df: pd.DataFrame, df_tipos: pd.DataFrame) -> pd.DataFrame:
+    """Obtiene el último saldo real conocido."""
     keys = ["edo", "adm", "sucursal"]
-    # Tomamos el último registro ordenado por fecha
+    if df.empty:
+        return pd.DataFrame(columns=keys + ["saldo_final", "fecha", "tipo"])
+
     ultimo = (
         df.sort_values("fecha")
         .groupby(keys)
-        .tail(1)[keys + ["saldo_final", "fecha"]] # Incluimos fecha para referencia
+        .tail(1)[keys + ["saldo_final", "fecha"]]
         .copy()
     )
     ultimo = ultimo.merge(df_tipos, on=keys, how="left")
@@ -25,6 +34,9 @@ def calcular_ultimo_saldo(df: pd.DataFrame, df_tipos: pd.DataFrame) -> pd.DataFr
 
 def promedios_ultimos_n(df: pd.DataFrame) -> pd.DataFrame:
     keys = ["edo", "adm", "sucursal"]
+    if df.empty:
+        return pd.DataFrame(columns=keys + ["entrada_prom", "salida_prom", "flujo_efectivo_prom"])
+
     prom = (
         df.groupby(keys)
         .agg({
@@ -38,6 +50,7 @@ def promedios_ultimos_n(df: pd.DataFrame) -> pd.DataFrame:
         "salidas": "salida_prom",
         "flujo_efectivo": "flujo_efectivo_prom",
     })
+    
     prom["tamaño_flujo"] = prom["entrada_prom"] + prom["salida_prom"]
     denom = prom["flujo_efectivo_prom"] + 1e-6
     prom["indice_actividad"] = abs(prom["tamaño_flujo"] / denom)
@@ -61,6 +74,7 @@ def asignar_rango(row) -> str:
             return "E"
         return "Fuera de Rango"
 
+    # Lógica extra: Subir rango por alta actividad
     keys = list(rangos_tipo.keys())
     if asignado in keys:
         idx = keys.index(asignado)
@@ -68,104 +82,107 @@ def asignar_rango(row) -> str:
             return keys[idx + 1]
     return asignado
 
-def encontrar_dia_transferencia(row, df_futuro: pd.DataFrame):
+# -------------------------------------------------------------------------
+# LÓGICA DE SIMULACIÓN (Enfoque Dominó)
+# -------------------------------------------------------------------------
+
+def simular_plan_transferencias(row, df_futuro: pd.DataFrame):
     """
-    Simula el saldo día a día.
+    Simula el saldo día a día. Si detecta una alerta:
+    1. Calcula la transferencia.
+    2. Resetea el saldo al punto medio (simulando la acción).
+    3. Continúa calculando los días siguientes con el saldo limpio.
     """
     tipo = row["tipo"]
     rango = row["rango"]
-    # Convertimos a float nativo para evitar problemas de tipos numpy
-    saldo = float(row["saldo_final"]) 
+    saldo_simulado = float(row["saldo_final"]) 
+    
+    acciones = [] 
     
     if tipo not in RANGOS or rango not in RANGOS[tipo]:
-        return None, 0.0
+        return []
 
     min_val, max_val = RANGOS[tipo][rango]
     punto_medio = (min_val + max_val) / 2
 
-    # --- FILTRO ROBUSTO ---
-    # Usamos .values para asegurar comparación segura, 
-    # asumiendo que ya limpiamos los tipos en la función principal
+    # Filtro específico para esta sucursal
     filtro = (
         (df_futuro["edo"] == row["edo"]) & 
         (df_futuro["adm"] == row["adm"]) & 
         (df_futuro["sucursal"] == row["sucursal"])
     )
     
-    # Ordenamos por fecha para simular cronológicamente
     datos = df_futuro[filtro].sort_values("fecha").copy()
 
-    # DEBUG: Si no encuentra datos para esta sucursal, retornamos vacío
     if datos.empty:
-        return None, 0.0
+        return []
 
-    fecha_salida = None
-    
-    # Simulación día a día
+    # Bucle día a día
     for _, fila in datos.iterrows():
-        flujo_predicho = float(fila["flujo_efectivo"])
-        saldo += flujo_predicho
+        flujo_diario = float(fila["flujo_efectivo"])
+        fecha_actual = fila["fecha"]
         
-        # Chequeo de límites
-        if saldo < min_val or saldo > max_val:
-            fecha_salida = fila["fecha"]
-            break
-
-    # Cálculo monto sugerido
-    suma_total_futuro = float(datos["flujo_efectivo"].sum())
-    saldo_proyectado_final = float(row["saldo_final"]) + suma_total_futuro
-    
-    # Si nunca se sale en los días predichos, tomamos la última fecha disponible
-    # pero el monto sugerido sería 0 si el saldo final está en rango.
-    if fecha_salida is None:
-        # Chequeamos si al final del periodo estamos fuera
-        if saldo_proyectado_final < min_val or saldo_proyectado_final > max_val:
-             fecha_salida = datos["fecha"].max()
-        else:
-             return None, 0.0 # Todo en orden
-    
-    transferencia = round(punto_medio - saldo_proyectado_final, 2)
-    return fecha_salida, transferencia
+        # 1. Aplicar flujo natural
+        saldo_simulado += flujo_diario
+        
+        # 2. Verificar límites
+        if saldo_simulado < min_val or saldo_simulado > max_val:
+            # ¡ALERTA!
+            transferencia = round(punto_medio - saldo_simulado, 2)
+            
+            acciones.append({
+                "fecha": fecha_actual,
+                "monto": transferencia,
+                "saldo_antes": saldo_simulado,
+                "saldo_despues": punto_medio
+            })
+            
+            # 3. RESET VIRTUAL (Simulamos la corrección)
+            saldo_simulado = punto_medio 
+            
+    return acciones
 
 def calcular_analisis_transferencias(df_hist, df_fut):
-    """Función orquestadora principal con LIMPIEZA DE DATOS."""
+    """Orquestador Principal."""
     if df_hist.empty:
         return pd.DataFrame()
 
-    # --- 0. PRE-LIMPIEZA DE TIPOS (CRUCIAL) ---
-    # Convertimos edo y adm a enteros para garantizar el cruce
-    # Limpiamos espacios en blanco en sucursales
+    # --- 1. LIMPIEZA DE DATOS (Tipos) ---
     for df in [df_hist, df_fut]:
         if not df.empty:
-            df["edo"] = pd.to_numeric(df["edo"], errors='coerce').fillna(0).astype(int)
-            df["adm"] = pd.to_numeric(df["adm"], errors='coerce').fillna(0).astype(int)
+            if "edo" in df.columns:
+                df["edo"] = pd.to_numeric(df["edo"], errors='coerce').fillna(0).astype(int)
+            if "adm" in df.columns:
+                df["adm"] = pd.to_numeric(df["adm"], errors='coerce').fillna(0).astype(int)
             if "sucursal" in df.columns:
                 df["sucursal"] = df["sucursal"].astype(str).str.strip()
 
-    # 1. Determinar tipos
+    # --- 2. ESTADO ACTUAL ---
     df_tipos = determine_tipo_sucursal(df_hist)
-    
-    # 2. Obtener estado actual
     ult = calcular_ultimo_saldo(df_hist, df_tipos)
-    
-    # 3. Obtener métricas promedio
     prom = promedios_ultimos_n(df_hist)
     
-    # 4. Unir todo
     keys = ["edo", "adm", "sucursal"]
     df = pd.merge(ult, prom, on=keys, how="left")
     
-    # 5. Asignar Rango
+    # Asignar Rango
     df["rango"] = df.apply(asignar_rango, axis=1)
     
-    # 6. Calcular fechas de transferencia
-    # Pasamos el df_fut completo, el filtrado ocurre dentro fila por fila
-    resultados = df.apply(
-        lambda r: encontrar_dia_transferencia(r, df_fut), axis=1
+    # --- 3. SIMULACIÓN ---
+    columna_planes = df.apply(
+        lambda r: simular_plan_transferencias(r, df_fut), axis=1
     )
     
-    # Desempaquetar tuplas
-    df["fecha_alerta"] = [x[0] for x in resultados]
-    df["monto_sugerido"] = [x[1] for x in resultados]
+    # --- 4. EXTRACCIÓN PRIMERA ALERTA ---
+    def extraer_primera_alerta(lista_acciones):
+        if not lista_acciones:
+            return None, 0.0
+        # Retorna fecha y monto de la primera acción
+        return lista_acciones[0]["fecha"], lista_acciones[0]["monto"]
+
+    datos_desempaquetados = columna_planes.apply(extraer_primera_alerta)
+    
+    df["fecha_alerta"] = [x[0] for x in datos_desempaquetados]
+    df["monto_sugerido"] = [x[1] for x in datos_desempaquetados]
     
     return df

@@ -1,6 +1,7 @@
 import requests
 import psycopg
 import pandas as pd
+from datetime import date
 from .config import API_URL, PG_DSN, PG_SCHEMA_HIST, PG_SCHEMA_PRED
 
 def fetch_data_from_api(payload):
@@ -14,7 +15,7 @@ def fetch_data_from_api(payload):
 def save_predictions_to_db(df: pd.DataFrame):
     """
     Guarda el DataFrame de predicciones en PostgreSQL.
-    Columnas en español coinciden con la BD.
+    Asume que la tabla en BD tiene los mismos nombres de columnas en español que el DF.
     """
     cols = [
         "edo", "adm", "sucursal", "fecha_predicha",
@@ -45,14 +46,14 @@ def save_predictions_to_db(df: pd.DataFrame):
 
 def fetch_history_for_transfer(limit: int = 60):
     """
-    Trae los últimos N registros históricos.
-    IMPORTANTE: Trae edo, adm, sucursal.
+    Trae los últimos N registros históricos por sucursal.
+    Construye el DataFrame manualmente para evitar warnings de SQLAlchemy.
     """
     sql = f"""
     WITH ranked AS (
         SELECT 
             edo, adm, sucursal,
-            id_sucursal, -- Opcional si ya usas adm
+            id_sucursal, 
             fecha,
             COALESCE(extsal, 0) as saldo_final,
             COALESCE(sumingresos, 0) as entradas,
@@ -61,44 +62,62 @@ def fetch_history_for_transfer(limit: int = 60):
             ROW_NUMBER() OVER (PARTITION BY edo, adm, sucursal ORDER BY fecha DESC) as rn
         FROM {PG_SCHEMA_HIST}.base_filtrada
     )
-    SELECT * FROM ranked WHERE rn <= %s
+    SELECT 
+        edo, adm, sucursal, id_sucursal, fecha, 
+        saldo_final, entradas, salidas, flujo_efectivo 
+    FROM ranked WHERE rn <= %s
     ORDER BY edo, adm, sucursal, fecha ASC
     """
     try:
         with psycopg.connect(PG_DSN) as conn:
-            df = pd.read_sql(sql, conn, params=(limit,))
-        return df
+            with conn.cursor() as cur:
+                cur.execute(sql, (limit,))
+                rows = cur.fetchall()
+                
+                # Obtener nombres de columnas del cursor
+                cols = [desc[0] for desc in cur.description]
+                return pd.DataFrame(rows, columns=cols)
+                
     except Exception as e:
         print(f"Error fetching history: {e}")
         return pd.DataFrame()
 
-def fetch_future_predictions(days_ahead: int = 30):
+def fetch_future_predictions(start_date_str: str = None, days_ahead: int = 30):
     """
-    Trae las predicciones futuras.
-    IMPORTANTE: SELECT debe incluir edo, adm, sucursal explícitamente.
+    Trae las predicciones futuras a partir de una fecha dada.
+    
+    Args:
+        start_date_str: Fecha de inicio (YYYY-MM-DD). Si es None, usa hoy.
+                        Importante para simular con datos antiguos (2022).
+        days_ahead: Cuántos días a futuro traer.
     """
+    if not start_date_str:
+        start_date_str = date.today().isoformat()
+
     sql = f"""
     SELECT 
         edo, adm, sucursal,
         fecha_predicha as fecha,
         prediccion as flujo_efectivo
     FROM {PG_SCHEMA_PRED}.predicciones_flujo
-    WHERE fecha_predicha >= CURRENT_DATE
-    AND fecha_predicha <= CURRENT_DATE + interval '%s days'
+    WHERE fecha_predicha > %s 
+    AND fecha_predicha <= %s::date + interval '%s days'
     ORDER BY edo, adm, sucursal, fecha_predicha ASC
     """
     try:
         with psycopg.connect(PG_DSN) as conn:
-            df = pd.read_sql(sql, conn, params=(days_ahead,))
-            
-            # --- CORRECCIÓN DE SEGURIDAD ---
-            # Si el DataFrame viene vacío, pandas no infiere tipos.
-            # Aseguramos que las columnas existan para evitar KeyError
-            if df.empty:
-                return pd.DataFrame(columns=["edo", "adm", "sucursal", "fecha", "flujo_efectivo"])
+            with conn.cursor() as cur:
+                cur.execute(sql, (start_date_str, start_date_str, days_ahead))
+                rows = cur.fetchall()
                 
-        return df
+                cols = [desc[0] for desc in cur.description]
+                df = pd.DataFrame(rows, columns=cols)
+                
+                if df.empty:
+                     # Estructura vacía para evitar crash
+                     return pd.DataFrame(columns=["edo", "adm", "sucursal", "fecha", "flujo_efectivo"])
+                return df
+                
     except Exception as e:
         print(f"Error fetching predictions: {e}")
-        # Retornar DF vacío con estructura correcta para evitar crash
         return pd.DataFrame(columns=["edo", "adm", "sucursal", "fecha", "flujo_efectivo"])
