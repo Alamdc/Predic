@@ -43,22 +43,60 @@ def safe_fit(model, Xtr, ytr, Xva=None, yva=None, early_stopping=0):
 
 def enrich_features(g: pd.DataFrame):
     g = g.copy()
-    g["neto_es"] = (g["entradas"] - g["salidas"]).astype(float)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        g["ratio_es"] = np.where(
-            (g["salidas"].astype(float) + 1.0) != 0.0,
-            g["entradas"].astype(float) / (g["salidas"].astype(float) + 1.0),
-            0.0
-        )
-    g["abs_diff_es"] = (g["entradas"].astype(float) - g["salidas"].astype(float)).abs()
     
-    g["seno_dia_sem"] = np.sin(2*np.pi*(g["dia_semana"].astype(float)/7.0))
-    g["cos_dia_sem"] = np.cos(2*np.pi*(g["dia_semana"].astype(float)/7.0))
-    g["seno_mes"] = np.sin(2*np.pi*(g["mes"].astype(float)/12.0))
-    g["cos_mes"] = np.cos(2*np.pi*(g["mes"].astype(float)/12.0))
+    # --- 1. PREPARACIÓN BÁSICA ---
+    if 'fecha' in g.columns:
+        if not np.issubdtype(g['fecha'].dtype, np.datetime64):
+            g['fecha'] = pd.to_datetime(g['fecha'])
+        g = g.sort_values('fecha')
+        
+        # --- 2. CARACTERÍSTICAS DE CALENDARIO ---
+        g['dia'] = g['fecha'].dt.day
+        g['mes'] = g['fecha'].dt.month
+        g['dia_semana'] = g['fecha'].dt.dayofweek
+        
+        g['es_fin_de_semana'] = g['dia_semana'].isin([5, 6]).astype(int)
+        g['es_quincena'] = g['dia'].isin([15, 30, 31]).astype(int)
+        g['es_inicio_mes'] = (g['dia'] <= 5).astype(int)
+        g['es_fin_mes'] = g['fecha'].dt.is_month_end.astype(int)
+
+        g['sin_dia_semana'] = np.sin(2 * np.pi * g['dia_semana'] / 7)
+        g['cos_dia_semana'] = np.cos(2 * np.pi * g['dia_semana'] / 7)
+        g['sin_mes'] = np.sin(2 * np.pi * g['mes'] / 12)
+        g['cos_mes'] = np.cos(2 * np.pi * g['mes'] / 12)
     
-    extra = ["neto_es","ratio_es","abs_diff_es","seno_dia_sem","cos_dia_sem","seno_mes","cos_mes"]
-    return g, BASE_FEATURES + extra
+    # --- 3. LAGS (PROTEGIDO) ---
+    target = 'flujo_efectivo'
+    
+    # SOLO calculamos lags si tenemos la historia (Entrenamiento)
+    if target in g.columns:
+        g['lag_1'] = g[target].shift(1)
+        g['lag_7'] = g[target].shift(7)
+        g['lag_14'] = g[target].shift(14)
+        g['lag_30'] = g[target].shift(30)
+        
+        g['media_movil_7'] = g[target].rolling(window=7).mean().shift(1)
+        g['media_movil_30'] = g[target].rolling(window=30).mean().shift(1)
+        g['std_movil_7'] = g[target].rolling(window=7).std().shift(1)
+    
+    # --- 4. DEFINICIÓN DE FEATURES ---
+    features = [
+        'dia', 'mes', 'dia_semana', 
+        'es_fin_de_semana', 'es_quincena', 'es_inicio_mes', 'es_fin_mes',
+        'sin_dia_semana', 'cos_dia_semana', 'sin_mes', 'cos_mes',
+        'lag_1', 'lag_7', 'lag_14', 'lag_30',
+        'media_movil_7', 'media_movil_30', 'std_movil_7'
+    ]
+    
+    # Rellenar NaNs con 0 para evitar errores en predicción si faltan datos
+    # Esto asegura que si 'xrow' envía los lags, se respeten, y si faltan, sean 0.
+    for col in features:
+        if col not in g.columns:
+            g[col] = 0.0
+            
+    g = g.fillna(0)
+    
+    return g, features
 
 def build_future_calendar(d: date) -> dict:
     ts = pd.Timestamp(d).isocalendar()

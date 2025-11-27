@@ -121,3 +121,47 @@ def fetch_future_predictions(start_date_str: str = None, days_ahead: int = 30):
     except Exception as e:
         print(f"Error fetching predictions: {e}")
         return pd.DataFrame(columns=["edo", "adm", "sucursal", "fecha", "flujo_efectivo"])
+    
+
+def save_sarimax_predictions_to_db(df: pd.DataFrame):
+    """
+    Guarda las predicciones generadas por SARIMAX en PostgreSQL.
+    """
+    cols = [
+        "edo", "adm", "sucursal", "fecha_predicha",
+        "prediccion", "limite_inferior", "limite_superior",
+        "orden_arima", "orden_estacional", "aic", 
+        "entrenado_hasta"
+    ]
+    
+    # Query de inserción con UPSERT (On Conflict Update)
+    insert_sql = f"""
+    INSERT INTO {PG_SCHEMA_PRED}.predicciones_sarimax
+    ({', '.join(cols)})
+    VALUES ({', '.join(['%s']*len(cols))})
+    ON CONFLICT (edo, adm, sucursal, fecha_predicha)
+    DO UPDATE SET
+      prediccion = EXCLUDED.prediccion,
+      limite_inferior = EXCLUDED.limite_inferior,
+      limite_superior = EXCLUDED.limite_superior,
+      orden_arima = EXCLUDED.orden_arima,
+      orden_estacional = EXCLUDED.orden_estacional,
+      aic = EXCLUDED.aic,
+      entrenado_hasta = EXCLUDED.entrenado_hasta,
+      created_at = NOW();
+    """
+    
+    try:
+        with psycopg.connect(PG_DSN) as conn:
+            with conn.cursor() as cur:
+                # Convertimos el DF a lista de tuplas respetando el orden de cols
+                batch = []
+                for _, row in df.iterrows():
+                    batch.append(tuple(row.get(c, None) for c in cols))
+                
+                cur.executemany(insert_sql, batch)
+                conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error guardando SARIMAX: {e}")
+        return False
