@@ -1,343 +1,365 @@
-import json
-from datetime import timedelta
-import numpy as np
-import pandas as pd
-import xgboost as xgb
 import streamlit as st
-import plotly.graph_objects as go
+import pandas as pd
+import numpy as np
+from datetime import date, timedelta
+import warnings
+import json
+import xgboost as xgb
 from sklearn.ensemble import IsolationForest
+import plotly.graph_objects as go
 
-# --- LOCAL IMPORTS ---
+# --- IMPORTACIONES LOCALES ---
 from utils.modeling import (
-    TARGET, enrich_features, safe_fit, random_tune, 
-    rolling_backtest, compute_estacional_tables, build_future_calendar,
+    TARGET, enrich_features, safe_fit, 
+    compute_estacional_tables, build_future_calendar,
     get_future_es, bootstrap_pred_interval
 )
 from utils.db_client import fetch_data_from_api, save_predictions_to_db
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Generador de Predicciones", layout="wide")
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(page_title="Proyecciones XGBoost", layout="wide")
+warnings.filterwarnings("ignore")
 
+# --- ESTILOS Y TÍTULO ---
 st.title("Generador de Proyecciones Financieras")
-st.markdown("### Motor de Inferencia (XGBoost) con Limpieza de Anomalias")
+st.markdown("### Motor de Inferencia (XGBoost) con Limpieza")
 st.markdown("""
-Este modulo permite entrenar modelos predictivos personalizados por sucursal, aplicar limpieza de anomalias (Isolation Forest + Reglas de Negocio) y generar proyecciones de flujo de efectivo.
+Este modulo utiliza algoritmos de Gradient Boosting (XGBoost) para identificar patrones complejos.
+Incluye pre-procesamiento con Isolation Forest para eliminar distorsiones por flujos atipicos.
 """)
 st.divider()
 
 # ==========================================
-# 1. SIDEBAR CONFIGURATION
+# 1. BARRA LATERAL (FILTROS Y CONFIG)
 # ==========================================
 with st.sidebar:
     st.header("Parametros de Ejecucion")
     
     with st.container(border=True):
-        st.subheader("1. Extraccion de Datos")
-        st.info("Filtros para la consulta")
+        st.subheader("1. Busqueda de Sucursal")
+        st.info("Puede buscar por ADM, Estado o Nombre")
         
-        edo = st.number_input("Estado (edo)", min_value=0, value=None, step=1, format="%d")
-        adm = st.number_input("ID Sucursal (adm)", min_value=0, value=None, step=1, format="%d")
-        sucursal = st.text_input("Nombre Sucursal (Opcional)")
-        
-        col_d1, col_d2 = st.columns(2)
-        start = col_d1.date_input("Fecha Inicio", value=None)
-        end = col_d2.date_input("Fecha Fin", value=None)
-
-        if start and end and start > end:
-            st.error("Error: La fecha de inicio es posterior a la fecha fin.")
+        edo_code = st.number_input("Estado (edo)", min_value=0, value=0, step=1, format="%d")
+        adm_code = st.number_input("ID Admin (adm)", min_value=0, value=0, step=1, format="%d", help="El ID unico numerico de la sucursal")
+        sucursal_txt = st.text_input("Nombre Sucursal (Opcional)", value="", help="Busqueda exacta por nombre")
 
     with st.container(border=True):
         st.subheader("2. Configuracion del Modelo")
-        n_days = st.number_input("Horizonte de Pronostico (Dias)", min_value=1, max_value=90, value=7)
-        
-        st.markdown("---")
-        st.write("**Configuracion de Limpieza**")
-        contamination = st.slider("Sensibilidad Isolation Forest", 0.01, 0.10, 0.02, help="Porcentaje de datos a considerar anomalos estadisticamente")
-        umbral_millones = st.number_input("Umbral Maximo (Millones)", min_value=0.5, max_value=50.0, value=2.0, step=0.5, help="Cualquier flujo mayor a esta cantidad sera eliminado y suavizado.")
+        days_history = st.slider("Dias de historia a usar", 60, 2000, 365, help="Cuantos dias hacia atras usar para entrenar.")
+        forecast_horizon = st.number_input("Horizonte de Pronostico (Dias)", min_value=1, max_value=60, value=7)
+        # Nota: XGBoost no usa "ciclo estacional" explícito como parámetro, lo aprende de los features, 
+        # pero mantenemos la estética similar.
+
+    with st.container(border=True):
+        st.subheader("3. Configuracion de Limpieza")
+        usar_limpieza = st.checkbox("Activar Limpieza de Datos", value=True)
+        contamination = st.slider("Sensibilidad Isolation Forest", 0.01, 0.10, 0.02, disabled=not usar_limpieza)
+        umbral_millones = st.number_input("Umbral Maximo (Millones)", min_value=0.5, max_value=50.0, value=2.0, step=0.5, disabled=not usar_limpieza)
 
     st.write("")
-    # Step 1 Button
-    btn_cargar = st.button("1. Iniciar Carga de Datos", type="primary", use_container_width=True)
+    btn_buscar = st.button("Buscar Datos", type="primary", use_container_width=True)
 
 # ==========================================
-# HELPER FUNCTION: ISOLATION FOREST + THRESHOLD
+# FUNCIONES AUXILIARES
 # ==========================================
-def aplicar_isolation_forest_hibrido(df, col_target, contaminacion, umbral_m):
+def aplicar_limpieza_hibrida(df, col_target, contaminacion, umbral_m):
     """
-    Detects anomalies using both Isolation Forest and a Hard Threshold.
+    Limpia una serie temporal usando Isolation Forest + Regla de Negocio.
     """
+    g = df.copy().sort_values('fecha')
+    umbral_valor = umbral_m * 1_000_000
+    
+    # 1. Isolation Forest (Estadístico)
     model = IsolationForest(contamination=contaminacion, random_state=42)
-    umbral_valor = umbral_m * 1_000_000 # Convertir millones a unidades
+    X = g[[col_target]].values
+    preds = model.fit_predict(X) # -1 es outlier
     
-    # Process by group to avoid mixing scales
-    grupos = df.groupby(['edo', 'adm', 'sucursal'])
-    dfs_limpios = []
+    # 2. Regla Dura (Umbral de Millones)
+    mask_exceso = g[col_target].abs() > umbral_valor
+    preds[mask_exceso] = -1
     
-    for name, group in grupos:
-        g = group.copy().sort_values('fecha')
-        
-        # 1. Statistical Detection (Isolation Forest)
-        X = g[[col_target]].values
-        preds = model.fit_predict(X) # -1 is outlier
-        
-        # 2. Business Rule Detection (Threshold)
-        # Si el valor absoluto supera el umbral, forzamos a -1 (outlier)
-        mask_exceso = g[col_target].abs() > umbral_valor
-        preds[mask_exceso] = -1
-        
-        g['is_outlier'] = preds
-        
-        # 3. Imputation (Interpolation)
-        g['original'] = g[col_target] # Save original for comparison
-        g.loc[g['is_outlier'] == -1, col_target] = np.nan
-        g[col_target] = g[col_target].interpolate(method='linear', limit_direction='both')
-        
-        dfs_limpios.append(g)
-        
-    return pd.concat(dfs_limpios)
+    g['is_outlier'] = preds
+    g['original'] = g[col_target]
+    
+    # 3. Imputar (Interpolación)
+    g.loc[g['is_outlier'] == -1, col_target] = np.nan
+    g[col_target] = g[col_target].interpolate(method='linear', limit_direction='both')
+    
+    return g
+
+def plot_xgboost_results(history_df, pred_df, title_text):
+    fig = go.Figure()
+    # Historia (Últimos 180 días visuales)
+    viz_history = history_df.tail(180)
+    fig.add_trace(go.Scatter(
+        x=viz_history.index, y=viz_history[TARGET],
+        mode='lines', name='Historia Entrenada', line=dict(color='#6c757d', width=1.5)
+    ))
+    # Intervalos
+    fig.add_trace(go.Scatter(
+        x=pred_df['fecha_predicha'], y=pred_df['limite_superior'],
+        mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'
+    ))
+    fig.add_trace(go.Scatter(
+        x=pred_df['fecha_predicha'], y=pred_df['limite_inferior'],
+        line=dict(width=0), mode='lines', fill='tonexty', fillcolor='rgba(40, 167, 69, 0.15)', # Verde para XGB
+        name='Intervalo Confianza (95%)', hoverinfo='skip'
+    ))
+    # Predicción
+    fig.add_trace(go.Scatter(
+        x=pred_df['fecha_predicha'], y=pred_df['prediccion'],
+        mode='lines+markers', name='Proyeccion XGBoost',
+        line=dict(color='#28a745', width=2.5), marker=dict(size=6)
+    ))
+    fig.update_layout(
+        title=title_text, xaxis_title="Fecha", yaxis_title="Flujo ($)",
+        height=450, hovermode="x unified", template="plotly_white"
+    )
+    return fig
 
 # ==========================================
-# STEP 1: LOAD DATA
+# 2. LÓGICA PRINCIPAL
 # ==========================================
-if btn_cargar:
-    payload = {
-        "edo": int(edo) if edo is not None else None,
-        "adm": int(adm) if adm is not None else None,
-        "sucursal": sucursal if sucursal else None,
-        "start": start.isoformat() if start else None,
-        "end": end.isoformat() if end else None,
-        "limit": 1000000
-    }
-    with st.spinner("Conectando con API de Datos..."):
-        data = fetch_data_from_api(payload)
-        if data:
-            df = pd.DataFrame(data)
-            if "fecha" in df.columns:
-                df["fecha"] = pd.to_datetime(df["fecha"]).dt.date
-            
-            # Save to session
-            st.session_state['step1_df'] = df
-            # Clear subsequent steps
-            st.session_state.pop('step2_df', None)
-            st.session_state.pop('step3_results', None)
-            st.success(f"Carga exitosa: {len(df)} registros obtenidos.")
-        else:
-            st.warning("La consulta no devolvio resultados.")
 
-# Display Data Preview if Step 1 is done
-if 'step1_df' in st.session_state:
-    df_step1 = st.session_state['step1_df']
+if 'search_data_xgb' not in st.session_state:
+    st.session_state['search_data_xgb'] = None
+
+if btn_buscar:
+    if (edo_code == 0) and (adm_code == 0) and (not sucursal_txt):
+        st.error("Debe ingresar al menos un criterio (Estado, ADM o Nombre).")
+    else:
+        with st.spinner("Conectando con base de datos tdv_data..."):
+            
+            payload = {
+                "edo": edo_code if edo_code != 0 else None,
+                "adm": adm_code if adm_code != 0 else None,
+                "sucursal": sucursal_txt if sucursal_txt else None,
+                "start": None, 
+                "end": None,
+                "limit": 10000 
+            }
+            
+            try:
+                rows = fetch_data_from_api(payload)
+                if not rows:
+                    st.warning("La consulta no devolvio registros.")
+                    st.session_state['search_data_xgb'] = None
+                else:
+                    df = pd.DataFrame(rows)
+                    if "fecha" in df.columns:
+                        df["fecha"] = pd.to_datetime(df["fecha"]).dt.date
+                    df = df.sort_values('fecha')
+                    st.session_state['search_data_xgb'] = df
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error de conexion: {e}")
+
+# --- SELECCIÓN Y ENTRENAMIENTO ---
+if st.session_state['search_data_xgb'] is not None:
+    df_raw = st.session_state['search_data_xgb']
     
-    with st.expander("Visualizar Datos de Entrada", expanded=False):
-        st.dataframe(df_step1.head(), use_container_width=True)
+    st.success(f"Se encontraron {len(df_raw)} registros historicos.")
     
-    st.divider()
-
-    # ==========================================
-    # STEP 2: CLEANING (Isolation Forest + Reglas)
-    # ==========================================
-    st.subheader("Paso 2: Limpieza de Anomalias")
-    st.info(f"Se eliminaran valores atipicos estadisticos Y cualquier flujo mayor a ${umbral_millones} Millones.")
+    # Selector de Sucursal
+    col_sel, col_act = st.columns([3, 1])
+    with col_sel:
+        opciones = df_raw[['adm', 'sucursal']].drop_duplicates().sort_values('adm')
+        opciones['label'] = opciones['adm'].astype(str) + " - " + opciones['sucursal']
+        
+        selection = st.selectbox(
+            "Seleccione la Sucursal a Modelar:", 
+            options=opciones['label'].tolist()
+        )
+        adm_seleccionado = int(selection.split(" - ")[0])
+        
+    # Filtrar DF para esa sucursal
+    # Nota: XGBoost necesita dataframe con columnas, no serie
+    df_target = df_raw[df_raw['adm'] == adm_seleccionado].copy()
     
-    col_btn_clean, col_dummy = st.columns([1, 3])
-    with col_btn_clean:
-        if st.button("2. Ejecutar Limpieza", use_container_width=True):
-            with st.spinner("Aplicando reglas y analisis estadistico..."):
-                # Call the new hybrid function
-                df_clean = aplicar_isolation_forest_hibrido(df_step1, 'flujo_efectivo', contamination, umbral_millones)
-                
-                st.session_state['step2_df'] = df_clean
-                st.success("Limpieza Completada")
+    # Convertir fecha a datetime para operaciones
+    df_target['fecha'] = pd.to_datetime(df_target['fecha'])
+    df_target = df_target.sort_values('fecha').reset_index(drop=True)
+    
+    # Recorte de Historia
+    if len(df_target) > days_history:
+        df_target = df_target.tail(days_history).reset_index(drop=True)
 
-    # Visualization of Cleaning
-    if 'step2_df' in st.session_state:
-        df_step2 = st.session_state['step2_df']
-        
-        n_outliers = (df_step2['is_outlier'] == -1).sum()
-        st.metric("Registros Corregidos (Outliers)", n_outliers)
-        
-        # Comparative Chart
-        fig = go.Figure()
-        # Outliers
-        outliers = df_step2[df_step2['is_outlier'] == -1]
-        fig.add_trace(go.Scatter(
-            x=outliers['fecha'], y=outliers['original'],
-            mode='markers', name='Dato Eliminado',
-            marker=dict(color='red', size=8, symbol='x')
-        ))
-        # Clean Line
-        fig.add_trace(go.Scatter(
-            x=df_step2['fecha'], y=df_step2['flujo_efectivo'],
-            mode='lines', name='Flujo Operativo (Limpio)',
-            line=dict(color='blue')
-        ))
-        fig.update_layout(title="Comparativa: Historia Real vs Historia Limpia", height=400)
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.divider()
-
-        # ==========================================
-        # STEP 3: TRAINING AND PREDICTION
-        # ==========================================
-        st.subheader("Paso 3: Entrenamiento y Proyeccion")
-        
-        col_btn_train, col_dummy2 = st.columns([1, 3])
-        with col_btn_train:
-            run_train = st.button("3. Entrenar Modelo", type="primary", use_container_width=True)
-        
-        if run_train:
-            df_final = st.session_state['step2_df']
+    # --- VISUALIZACIÓN DE LIMPIEZA PREVIA ---
+    if usar_limpieza:
+        with st.expander("Ver Analisis de Limpieza (Anomalias)", expanded=True):
+            df_preview_clean = aplicar_limpieza_hibrida(df_target, TARGET, contamination, umbral_millones)
+            n_out = (df_preview_clean['is_outlier'] == -1).sum()
             
-            metrics_rows = []
-            all_preds = []
+            st.markdown(f"**Anomalias detectadas:** {n_out}")
             
-            groups = list(df_final.groupby(["edo", "adm", "sucursal"]))
-            total_groups = len(groups)
-            
-            # Progress Bar logic
-            progress_container = st.container(border=True)
-            with progress_container:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-            
-            for idx, ((g_edo, g_adm, g_suc), g0) in enumerate(groups):
-                status_text.text(f"Procesando {idx+1}/{total_groups}: {g_suc}")
-                progress_bar.progress((idx + 1) / total_groups)
-                
-                g0 = g0.sort_values("fecha").reset_index(drop=True)
-                
-                if len(g0) < 60: continue 
+            fig_clean = go.Figure()
+            outliers = df_preview_clean[df_preview_clean['is_outlier'] == -1]
+            fig_clean.add_trace(go.Scatter(x=outliers['fecha'], y=outliers['original'], mode='markers', name='Anomalia Eliminada', marker=dict(color='red', size=8, symbol='x')))
+            fig_clean.add_trace(go.Scatter(x=df_preview_clean['fecha'], y=df_preview_clean[TARGET], mode='lines', name='Flujo Limpio', line=dict(color='green')))
+            fig_clean.update_layout(height=350, title="Impacto de la Limpieza", template="plotly_white")
+            st.plotly_chart(fig_clean, use_container_width=True)
 
-                # 1. Feature Engineering
-                g, FEATS = enrich_features(g0)
+    with col_act:
+        st.write("") 
+        st.write("")
+        btn_entrenar = st.button("Entrenar Modelo", type="primary")
 
-                # 2. Log Transform
+    if btn_entrenar:
+        if len(df_target) < 60:
+            st.error("No hay datos suficientes (minimo 60 dias) para entrenar XGBoost.")
+            st.stop()
+            
+        sucursal_nombre = df_target['sucursal'].iloc[0] 
+        edo_val = int(df_target['edo'].iloc[0])
+
+        with st.status(f"Procesando modelo XGBoost para {selection}...", expanded=True) as status:
+            try:
+                # 1. LIMPIEZA
+                if usar_limpieza:
+                    status.write("Aplicando Isolation Forest y Reglas de Negocio...")
+                    df_train = aplicar_limpieza_hibrida(df_target, TARGET, contamination, umbral_millones)
+                else:
+                    df_train = df_target.copy()
+
+                # 2. FEATURE ENGINEERING
+                status.write("Generando caracteristicas temporales (Lags, Medias Moviles)...")
+                g, FEATS = enrich_features(df_train)
+
+                # 3. TRANSFORMACIÓN Y SPLIT
                 y_min = float(g[TARGET].min())
                 shift = -y_min + 1.0 if y_min <= 0 else 0.0
                 g["_y_trans"] = np.log1p(g[TARGET] + shift)
 
-                # Train/Test Split
-                cutoff = len(g) - 14
+                cutoff = len(g) - 14 # Usamos ultimos 14 dias para validar internamente
                 train_df = g.iloc[:cutoff]
                 valid_df = g.iloc[cutoff:]
 
                 Xtr = train_df[FEATS]; ytr = train_df["_y_trans"]
                 Xva = valid_df[FEATS]; yva = valid_df["_y_trans"]
 
-                # Default Params
-                params = dict(
-                    n_estimators=500, max_depth=6, learning_rate=0.05,
-                    objective="reg:squarederror"
-                )
-
+                # 4. ENTRENAMIENTO
+                status.write(f"Entrenando XGBRegressor con {len(train_df)} registros...")
+                params = dict(n_estimators=500, max_depth=6, learning_rate=0.05, objective="reg:squarederror")
                 model = xgb.XGBRegressor(**params)
                 safe_fit(model, Xtr, ytr, Xva=Xva, yva=yva, early_stopping=20)
 
-                # Metrics
+                # Calculo de residuales para intervalos
                 yva_pred = model.predict(Xva)
-                rmse = float(np.sqrt(np.mean((yva - yva_pred)**2)))
+                rmse_val = float(np.sqrt(np.mean((yva - yva_pred)**2)))
                 resid_val = (np.expm1(yva) - shift) - (np.expm1(yva_pred) - shift)
 
-                metrics_rows.append({"adm": g_adm, "rmse": rmse})
-
-                # Future Projection
-                e_tab, s_tab, e_gl, s_gl = compute_estacional_tables(g0)
-                last_date = g0['fecha'].max()
-                future_dates = [last_date + timedelta(days=i) for i in range(1, int(n_days)+1)]
-                s_flujo = list(g0[TARGET].values.astype(float))
+                # 5. PROYECCIÓN FUTURA
+                status.write("Calculando proyecciones futuras...")
                 
+                # Tablas estacionales para inputs futuros
+                e_tab, s_tab, e_gl, s_gl = compute_estacional_tables(df_train)
+                last_date = df_train['fecha'].max()
+                future_dates = [last_date + timedelta(days=i) for i in range(1, int(forecast_horizon)+1)]
+                
+                s_flujo = list(df_train[TARGET].values.astype(float))
                 current_preds = []
+
                 for d in future_dates:
                     cal = build_future_calendar(d)
-                    e_fut, s_fut = get_future_es(
-                        cal["dia_semana"], cal["mes"], e_tab, s_tab, e_gl, s_gl, 0, 0
-                    )
+                    # Estimacion simple de entradas/salidas futuras (promedios estacionales)
+                    e_fut, s_fut = get_future_es(cal["dia_semana"], cal["mes"], e_tab, s_tab, e_gl, s_gl, 0, 0)
                     
                     s_series = pd.Series(s_flujo)
                     n_hist = len(s_flujo)
-                
+                    
+                    # Feature Construction (Manual Lags)
                     xrow = {
                         "fecha": d,
                         "entradas": e_fut, "salidas": s_fut, **cal,
-                        
-                        # Manual Lags
                         "lag_1": s_flujo[-1] if n_hist >= 1 else 0,
                         "lag_7": s_flujo[-7] if n_hist >= 7 else s_flujo[-1],
                         "lag_14": s_flujo[-14] if n_hist >= 14 else s_flujo[-1],
                         "lag_30": s_flujo[-30] if n_hist >= 30 else s_flujo[-1],
-                        
-                        # Manual Rolling Means
                         "media_movil_7": s_series.tail(7).mean() if n_hist >= 7 else s_flujo[-1],
                         "media_movil_30": s_series.tail(30).mean() if n_hist >= 30 else s_flujo[-1],
                         "std_movil_7": s_series.tail(7).std() if n_hist >= 7 else 0,
                     }
                     
+                    # Feature Enrichment
                     xdf_row, _ = enrich_features(pd.DataFrame([xrow]))
                     xdf_row = xdf_row.reindex(columns=FEATS, fill_value=0)
                     
+                    # Prediccion
                     yhat_log = float(model.predict(xdf_row)[0])
                     yhat = float(np.expm1(yhat_log) - shift)
                     yhat_, lo, hi = bootstrap_pred_interval(resid_val.values, yhat)
                     
                     current_preds.append({
-                        "edo": g_edo, "adm": g_adm, "sucursal": g_suc,
                         "fecha_predicha": d,
-                        "prediccion": yhat_, "limite_inferior": lo, "limite_superior": hi,
-                        "version_modelo": "xgb_iso_v1"
+                        "prediccion": yhat_, "limite_inferior": lo, "limite_superior": hi
                     })
                     s_flujo.append(yhat_)
+
+                df_pred = pd.DataFrame(current_preds)
                 
-                all_preds.append(pd.DataFrame(current_preds))
-            
-            progress_bar.progress(100)
-            status_text.text("Procesamiento completado.")
-            
-            if all_preds:
-                res_df = pd.concat(all_preds, ignore_index=True)
-                st.session_state['step3_results'] = res_df
-                st.success("Proyecciones Generadas")
-
-        # Visualization of Final Results
-        if 'step3_results' in st.session_state:
-            res_df = st.session_state['step3_results']
-            
-            st.divider()
-            st.subheader("Resultados Detallados")
-
-            # KPIs in Cards
-            col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
-            with col_kpi1:
-                with st.container(border=True):
-                    st.metric("Total Proyecciones", len(res_df))
-            with col_kpi2:
-                with st.container(border=True):
-                    st.metric("Sucursales", res_df['adm'].nunique())
-            with col_kpi3:
-                with st.container(border=True):
-                    st.metric("Horizonte", f"{n_days} Dias")
-
-            # Table configuration
-            st.dataframe(
-                res_df[["fecha_predicha", "prediccion", "limite_inferior", "limite_superior", "adm", "sucursal"]],
-                use_container_width=True,
-                column_config={
-                    "fecha_predicha": st.column_config.DateColumn("Fecha Proyeccion", format="DD/MM/YYYY"),
-                    "prediccion": st.column_config.NumberColumn("Flujo Proyectado", format="$ %.2f"),
-                    "limite_inferior": st.column_config.NumberColumn("Limite Inferior", format="$ %.2f"),
-                    "limite_superior": st.column_config.NumberColumn("Limite Superior", format="$ %.2f"),
-                    "adm": st.column_config.NumberColumn("ID Sucursal", format="%d")
+                # Guardar resultados en sesión
+                st.session_state['model_result_xgb'] = {
+                    "df_hist": df_train.set_index('fecha'), # Usamos la limpia para graficar
+                    "df_pred": df_pred,
+                    "meta": {
+                        "rmse": rmse_val,
+                        "sucursal": sucursal_nombre,
+                        "adm": adm_seleccionado,
+                        "edo": edo_val,
+                        "last_date": last_date
+                    }
                 }
-            )
-            
-            # Action Buttons
-            st.write("")
-            col_dl, col_db = st.columns(2)
-            
-            with col_dl:
-                csv = res_df.to_csv(index=False).encode('utf-8')
-                st.download_button("Descargar Reporte (CSV)", csv, "predicciones_limpias.csv", "text/csv", type="primary", use_container_width=True)
-            with col_db:
-                if st.button("Archivar Proyecciones en Base de Datos", use_container_width=True):
-                    with st.spinner("Escribiendo en base de datos PostgreSQL..."):
-                        save_predictions_to_db(res_df)
-                        st.success(f"Operacion exitosa: {len(res_df)} registros archivados.")
+                status.update(label="Modelo completado exitosamente", state="complete", expanded=False)
+                
+            except Exception as e:
+                st.error(f"Error en modelado: {e}")
+                st.stop()
+
+# --- MOSTRAR RESULTADOS ---
+if 'model_result_xgb' in st.session_state:
+    res = st.session_state['model_result_xgb']
+    meta = res['meta']
+    df_view = res['df_pred']
+    
+    st.divider()
+    st.subheader(f"Resultados del Pronostico: {meta['adm']} - {meta['sucursal']}")
+    
+    # Métricas Técnicas
+    k1, k2, k3 = st.columns(3)
+    k1.metric("RMSE (Log)", f"{meta['rmse']:.4f}", help="Error cuadratico medio en escala logaritmica (menor es mejor)")
+    k2.metric("Horizonte", f"{len(df_view)} Dias")
+    k3.metric("Modelo", "XGBoost Regressor")
+    
+    # Grafico
+    st.plotly_chart(plot_xgboost_results(res['df_hist'], res['df_pred'], "Proyeccion de Flujo (XGBoost)"), use_container_width=True)
+    
+    st.write("")
+    st.markdown("### Tabla de Predicciones")
+
+    st.dataframe(
+        df_view,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "fecha_predicha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"),
+            "prediccion": st.column_config.NumberColumn("Prediccion Flujo", format="$ %.2f"),
+            "limite_inferior": st.column_config.NumberColumn("Limite Inferior (95%)", format="$ %.2f"),
+            "limite_superior": st.column_config.NumberColumn("Limite Superior (95%)", format="$ %.2f")
+        }
+    )
+    
+    st.write("")
+    
+    if st.button("Guardar Predicciones en BD", type="secondary", use_container_width=True):
+        df_save = res['df_pred'].copy()
+        df_save["edo"] = meta["edo"]
+        df_save["adm"] = meta["adm"]
+        df_save["sucursal"] = meta["sucursal"]
+        df_save["version_modelo"] = "xgb_iso_v2"
+        df_save["entrenado_hasta"] = meta["last_date"]
+        df_save["variables_json"] = json.dumps({"rmse": meta["rmse"]})
+        
+        if save_predictions_to_db(df_save):
+            st.success(f"Datos guardados correctamente para {meta['sucursal']}")
+        else:
+            st.error("Error al guardar en base de datos.")
